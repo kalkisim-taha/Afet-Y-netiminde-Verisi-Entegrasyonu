@@ -1,81 +1,189 @@
 import React from 'react';
-import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler } from 'chart.js';
-import { Line } from 'react-chartjs-2';
-import { Wifi, TrendingUp } from 'lucide-react';
+import { ArrowRight, BarChart3, Route, Satellite, ShieldCheck, Waves, Wind } from 'lucide-react';
 
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
+const TYPE_LABELS = {
+  debris: 'Enkaz',
+  collapse: 'Yapı hasarı',
+  flood: 'Su baskını',
+  bridge: 'Köprü riski',
+  fire: 'Yangın',
+  gas: 'Gaz riski',
+  landslide: 'Heyelan',
+};
 
-export default function Dashboard({ earthquakes, riskData }) {
-  const totalQuakes = earthquakes.length;
-  let highestMag = 0;
-  earthquakes.forEach(q => {
-    if (q.properties.mag > highestMag) highestMag = q.properties.mag;
-  });
+const ROUTE_COPY = {
+  safest: 'Primer güvenli koridor',
+  balanced: 'Dengeli geçiş',
+  shortest: 'Kısa ama riskli hat',
+  contingency: 'Yedek acil hat',
+};
 
-  const recentQuakes = earthquakes.slice(0, 20).reverse();
-  const chartData = {
-    labels: recentQuakes.map(q => new Date(q.properties.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })),
-    datasets: [
-      {
-        label: 'Şiddet Yapay Zeka Trendi',
-        data: recentQuakes.map(q => q.properties.mag),
-        borderColor: '#ef4444',
-        backgroundColor: 'rgba(239, 68, 68, 0.2)',
-        tension: 0.4,
-        fill: true,
-        pointBackgroundColor: '#ef4444',
-      }
-    ]
-  };
+function toneForRoute(routeKey) {
+  if (routeKey === 'safest') return 'positive';
+  if (routeKey === 'shortest') return 'danger';
+  if (routeKey === 'contingency') return 'neutral';
+  return 'warning';
+}
 
-  const chartOptions = {
-    responsive: true,
-    maintainAspectRatio: false,
-    plugins: {
-      legend: { position: 'top', labels: { color: 'inherit' } },
-      title: { display: false }
-    },
-    scales: {
-      x: { ticks: { color: '#94a3b8', font: { size: 10 } }, grid: { color: 'rgba(128,128,128,0.1)' } },
-      y: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(128,128,128,0.1)' } }
-    }
-  };
+export default function Dashboard({
+  scenario,
+  routeData,
+  activeRouteKey,
+  setActiveRouteKey,
+}) {
+  const routeEntries = routeData?.routes
+    ? Object.entries(routeData.routes).filter(([, route]) => Boolean(route))
+    : [];
+
+  const hazardEntries = Object.entries(scenario?.stats?.countsByType || {});
 
   return (
-    <div className="dashboard-overlay">
-      <div className="glass-panel text-center" style={{padding: '1rem'}}>
-        <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', fontSize: '1.1rem' }}>
-          <TrendingUp size={20} color="#3b82f6" />
-          Yapay Zeka Tahmin Analizi
-        </h3>
-        <p style={{ fontSize: '0.8rem', marginTop: '0.5rem', marginBottom: '1rem', color: 'var(--text-muted)' }}>Hacim ve trend modellemesi.</p>
-        <div style={{ height: '160px' }}>
-          {totalQuakes > 0 ? (
-            <Line data={chartData} options={chartOptions} />
-          ) : (
-             <div style={{color: '#94a3b8', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center'}}>
-               Veri Bekleniyor...
-             </div>
-          )}
+    <aside className="dashboard dashboard-grid">
+      <div className="panel floating-panel dashboard-card">
+        <div className="section-title">
+          <BarChart3 size={16} />
+          <span>AI tespit dağılımı</span>
+        </div>
+
+        <div className="stack-list">
+          {hazardEntries.map(([type, count]) => {
+            const width = `${Math.max(24, (count / Math.max(scenario.stats.hazardCount, 1)) * 100)}%`;
+            return (
+              <div key={type} className="stack-row">
+                <div className="stack-copy">
+                  <strong>{TYPE_LABELS[type] || type}</strong>
+                  <span>{count} bulgu</span>
+                </div>
+                <div className="stack-bar">
+                  <div className="stack-fill" style={{ width }} />
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 
-      <div className="glass-panel" style={{padding: '1rem'}}>
-        <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, fontSize: '1rem' }}>
-          <Wifi size={18} color="#10b981" />
-          Küresel Makro İstatistikler (7 Gün)
-        </h3>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '1rem' }}>
-          <div className="stat-card">
-            <span className="text-muted" style={{fontSize: '0.9rem'}}>Toplam Etkinlikler</span>
-            <span className="stat-value" style={{fontSize: '1.25rem'}}>{totalQuakes}</span>
+      <div className="panel floating-panel dashboard-card">
+          <div className="section-title">
+            <ShieldCheck size={16} />
+            <span>Risk katmanları</span>
           </div>
-          <div className="stat-card">
-            <span className="text-muted" style={{fontSize: '0.9rem'}}>Tepe Yoğunluğu (Maks. Büyüklük)</span>
-            <span className="stat-value" style={{fontSize: '1.25rem', color: '#ef4444'}}>{highestMag.toFixed(1)}</span>
+
+        <div className="metric-grid compact">
+          <div className="metric-card">
+            <span>Toplam bulgu</span>
+            <strong>{scenario?.stats?.hazardCount ?? 0}</strong>
+          </div>
+          <div className="metric-card">
+            <span>Kapali segment</span>
+            <strong>{scenario?.stats?.blockedSegments ?? 0}</strong>
+          </div>
+            <div className="metric-card">
+              <span>Hazırlılık</span>
+              <strong>{scenario?.stats?.readinessScore ?? 0}</strong>
+            </div>
+            <div className="metric-card">
+              <span>Ortalama şiddet</span>
+              <strong>{scenario?.stats?.averageSeverity ?? 0}</strong>
+            </div>
+          </div>
+
+        <div className="weather-strip">
+          <div>
+            <Waves size={15} />
+            <span>{scenario?.weather?.humidity ?? 0}% nem</span>
+          </div>
+          <div>
+            <Wind size={15} />
+            <span>{scenario?.weather?.windKmh ?? 0} km/sa rüzgar</span>
           </div>
         </div>
       </div>
-    </div>
+
+      <div className="panel floating-panel dashboard-card">
+        <div className="section-title">
+          <Route size={16} />
+          <span>Koridor karşılaştırması</span>
+        </div>
+
+        <div className="mini-route-list compact-route-list route-grid-list">
+          {routeEntries.map(([routeKey, route]) => (
+            <button
+              type="button"
+              key={routeKey}
+              className={`mini-route-card tone-${toneForRoute(routeKey)} ${activeRouteKey === routeKey ? 'is-active' : ''}`}
+              onClick={() => setActiveRouteKey(routeKey)}
+            >
+              <div>
+                <strong>{ROUTE_COPY[routeKey] || routeKey}</strong>
+                <p>{route.distanceKm} km</p>
+              </div>
+              <div>
+                <strong>{route.etaMinutes} dk</strong>
+                <p>risk {route.riskScore}</p>
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {routeData?.analysis && (
+        <div className="panel floating-panel dashboard-card">
+          <div className="section-title">
+            <ArrowRight size={16} />
+            <span>Neden bu rota?</span>
+          </div>
+
+          <div className="analysis-card analysis-grid-card">
+            <div className="analysis-stat">
+              <span>Risk azalımı</span>
+              <strong>%{Math.round(routeData.analysis.riskReductionPercent || 0)}</strong>
+            </div>
+            <div className="analysis-stat">
+              <span>Kaçınılan hücre</span>
+              <strong>{routeData.analysis.avoidedBlockedCells}</strong>
+            </div>
+            <div className="analysis-stat">
+              <span>Tarama kapsamı</span>
+              <strong>{routeData.analysis.scanSummary.sectorsScanned}</strong>
+            </div>
+          </div>
+
+          <div className="bullet-list compact-bullet-list">
+            {(routeData.analysis.brief || []).map((line) => (
+              <div key={line} className="bullet-item">
+                <span className="bullet-dot" />
+                <span>{line}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="panel floating-panel dashboard-card">
+        <div className="section-title">
+          <Satellite size={16} />
+          <span>BKZS zaman penceresi</span>
+        </div>
+
+        <div className="compact-timeline-list timeline-stat-grid">
+          <div className="timeline-stat">
+            <span>Son tarama</span>
+            <strong>{scenario?.mission?.scanAgeMinutes} dk</strong>
+            <p>güncellendi</p>
+          </div>
+          <div className="timeline-stat">
+            <span>AI güven</span>
+            <strong>%{Math.round((scenario?.mission?.confidence || 0) * 100)}</strong>
+            <p>doğrulama</p>
+          </div>
+          <div className="timeline-stat timeline-stat-wide">
+            <span>Aktif rota modu</span>
+            <strong>{ROUTE_COPY[activeRouteKey] || activeRouteKey}</strong>
+            <p>haritada vurgulanıyor</p>
+          </div>
+        </div>
+      </div>
+    </aside>
   );
 }

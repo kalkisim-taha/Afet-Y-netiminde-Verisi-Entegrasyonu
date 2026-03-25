@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
 require('dotenv').config();
+const { SCENARIOS, HAZARD_META, getScenarioById, getSiteById, summarizeScenario } = require('./data/scenarios');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -9,82 +9,6 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
-
-const cache = { earthquakes: { data: null, lastFetch: null }, weather: {} };
-const CACHE_TTL_MS = 5 * 60 * 1000;
-
-app.get('/api/earthquakes', async (req, res) => {
-    try {
-        const now = Date.now();
-        if (cache.earthquakes.data && (now - cache.earthquakes.lastFetch < CACHE_TTL_MS)) {
-            return res.json(cache.earthquakes.data);
-        }
-        const response = await axios.get('https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_week.geojson');
-        cache.earthquakes.data = response.data;
-        cache.earthquakes.lastFetch = now;
-        res.json(response.data);
-    } catch (error) { res.status(500).json({ error: "Failed to fetch earthquake data" }); }
-});
-
-app.get('/api/weather', async (req, res) => {
-    const { lat, lon } = req.query;
-    if (!lat || !lon) return res.status(400).json({ error: "lat and lon required" });
-
-    const cacheKey = `${lat},${lon}`;
-    const now = Date.now();
-    if (cache.weather[cacheKey] && (now - cache.weather[cacheKey].lastFetch < CACHE_TTL_MS)) {
-        return res.json(cache.weather[cacheKey].data);
-    }
-    try {
-        const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m`;
-        const response = await axios.get(url);
-        cache.weather[cacheKey] = { data: response.data.current, lastFetch: now };
-        res.json(response.data.current);
-    } catch (error) { res.status(500).json({ error: "Failed to fetch weather data" }); }
-});
-
-app.post('/api/risk', (req, res) => {
-    const { features, weather, sensitivity } = req.body;
-    if (!features || !Array.isArray(features)) return res.status(400).json({ error: "Invalid features array" });
-
-    const frequency = features.length;
-    let totalMagnitude = 0;
-    features.forEach(quake => totalMagnitude += quake.properties.mag || 0);
-
-    const averageMagnitude = frequency > 0 ? totalMagnitude / frequency : 0;
-    const sensMultipliers = { 'low': 0.8, 'medium': 1.0, 'high': 1.2 };
-    const multiplier = sensMultipliers[sensitivity] || 1.0;
-
-    let baseScore = (frequency * 0.8) + (averageMagnitude * 2.5);
-    let windImpact = 0;
-    if (weather && weather.wind_speed_10m) {
-        if (weather.wind_speed_10m > 15) windImpact = 5; 
-        if (weather.wind_speed_10m > 25) windImpact = 10;
-    }
-
-    let riskScore = (baseScore + windImpact) * multiplier;
-    riskScore = Math.min(riskScore, 100);
-
-    let recentQuakesCount = features.filter(q => {
-        const diffHours = Math.abs(new Date() - new Date(q.properties.time)) / 36e5;
-        return diffHours < 48;
-    }).length;
-
-    let predictedScore = riskScore + (recentQuakesCount * 0.5 * multiplier);
-    predictedScore = Math.min(predictedScore, 100);
-
-    let riskLevel = 'Low'; let color = 'green';
-    if (riskScore >= 65) { riskLevel = 'High'; color = 'red'; } 
-    else if (riskScore > 35) { riskLevel = 'Medium'; color = 'yellow'; }
-
-    res.json({
-        score: riskScore.toFixed(1),
-        predicted_48h: predictedScore.toFixed(1),
-        level: riskLevel, color, frequency,
-        averageMagnitude: averageMagnitude.toFixed(2),
-        triggerAlert: (riskLevel === 'High' && predictedScore >= 70)
-    });
-});
 
 class PriorityQueue {
   constructor() { this.elements = []; }
@@ -104,208 +28,472 @@ const haversineDistance = (p1, p2) => {
     return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)));
 };
 
-app.post('/api/route', async (req, res) => {
-    const { start, end, features, isOperationMode } = req.body;
-    if (!start || !end) return res.status(400).json({ error: "Start and End points required" });
-    
-    const pointDist = haversineDistance(start, end);
-    let padding = 0.05; 
-    if (pointDist > 50) padding = 0.5; 
-    if (pointDist > 500) padding = 1.0; 
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
-    let minLat = Math.min(start[0], end[0]) - padding;
-    let maxLat = Math.max(start[0], end[0]) + padding;
-    let minLon = Math.min(start[1], end[1]) - padding;
-    let maxLon = Math.max(start[1], end[1]) + padding;
-    
-    const GRID_W = 30;
-    const GRID_H = 30;
-    const latStep = (maxLat - minLat) / GRID_H;
-    const lonStep = (maxLon - minLon) / GRID_W;
+const averagePoint = (points) => {
+  const total = points.reduce(
+    (acc, point) => {
+      acc.lat += point[0];
+      acc.lon += point[1];
+      return acc;
+    },
+    { lat: 0, lon: 0 }
+  );
 
-    const allCoords = [];
-    for (let y = 0; y < GRID_H; y++) {
-        for (let x = 0; x < GRID_W; x++) {
-            allCoords.push({ x, y, lat: minLat + (y * latStep) + (latStep/2), lon: minLon + (x * lonStep) + (lonStep/2) });
-        }
+  return [total.lat / points.length, total.lon / points.length];
+};
+
+function projectToPlane(origin, point) {
+  const latScale = 111;
+  const lonScale = 111 * Math.cos((origin[0] * Math.PI) / 180);
+
+  return {
+    x: (point[1] - origin[1]) * lonScale,
+    y: (point[0] - origin[0]) * latScale,
+  };
+}
+
+function distanceToSegmentKm(point, segmentStart, segmentEnd) {
+  const origin = averagePoint([point, segmentStart, segmentEnd]);
+  const p = projectToPlane(origin, point);
+  const a = projectToPlane(origin, segmentStart);
+  const b = projectToPlane(origin, segmentEnd);
+  const abx = b.x - a.x;
+  const aby = b.y - a.y;
+  const ab2 = abx * abx + aby * aby;
+
+  if (ab2 === 0) {
+    return Math.sqrt((p.x - a.x) ** 2 + (p.y - a.y) ** 2);
+  }
+
+  const apx = p.x - a.x;
+  const apy = p.y - a.y;
+  const ratio = clamp((apx * abx + apy * aby) / ab2, 0, 1);
+  const closestX = a.x + abx * ratio;
+  const closestY = a.y + aby * ratio;
+
+  return Math.sqrt((p.x - closestX) ** 2 + (p.y - closestY) ** 2);
+}
+
+function getBoundsForRoute(scenario, start, end) {
+  const points = [start, end, ...scenario.hazards.map((hazard) => hazard.center)];
+  const minLat = Math.min(...points.map((point) => point[0])) - 0.01;
+  const maxLat = Math.max(...points.map((point) => point[0])) + 0.01;
+  const minLon = Math.min(...points.map((point) => point[1])) - 0.01;
+  const maxLon = Math.max(...points.map((point) => point[1])) + 0.01;
+
+  return { minLat, maxLat, minLon, maxLon };
+}
+
+function scoreCell(cellPoint, scenario) {
+  let risk = 0;
+  let blocked = false;
+  let drivers = [];
+
+  scenario.hazards.forEach((hazard) => {
+    const meta = HAZARD_META[hazard.type];
+    const distanceKm = haversineDistance(cellPoint, hazard.center);
+    const spreadKm = hazard.radiusKm * 1.9;
+
+    if (distanceKm > spreadKm) {
+      return;
     }
 
-    let elevations = [];
-    try {
-        for(let i = 0; i < allCoords.length; i += 90) {
-            const chunk = allCoords.slice(i, i + 90);
-            const lats = chunk.map(c => c.lat.toFixed(4)).join(',');
-            const lons = chunk.map(c => c.lon.toFixed(4)).join(',');
-            const elevRes = await axios.get(`https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lons}`);
-            elevations = elevations.concat(elevRes.data.elevation || Array(chunk.length).fill(10));
-        }
-    } catch (e) {
-        elevations = Array(allCoords.length).fill(10);
+    const ratio = 1 - distanceKm / spreadKm;
+    const impact = meta.weight * hazard.severity * ratio;
+
+    risk += impact;
+    if (impact > 8) {
+      drivers.push({
+        type: hazard.type,
+        label: hazard.label,
+        impact: Number(impact.toFixed(1)),
+        color: meta.color,
+      });
     }
 
-    const grid = [];
-    let floodCount = 0;
-    let debrisCount = 0;
-    let coordIdx = 0;
-
-    for (let y = 0; y < GRID_H; y++) {
-        let row = [];
-        for (let x = 0; x < GRID_W; x++) {
-            const cellLat = allCoords[coordIdx].lat;
-            const cellLon = allCoords[coordIdx].lon;
-            const elev = elevations[coordIdx];
-            coordIdx++;
-
-            let rand = Math.abs(Math.sin(cellLat * 12.9898 + cellLon * 78.233)) * 43758.5453;
-            rand = rand - Math.floor(rand);
-
-            let cumulativeRisk = 0;
-            let hasDebris = false;
-            let hasFlood = false;
-            let isSea = (elev <= 0.5);
-
-            if (features) {
-                features.forEach(q => {
-                    const qLat = q.geometry.coordinates[1];
-                    const qLon = q.geometry.coordinates[0];
-                    const dist = haversineDistance([cellLat, cellLon], [qLat, qLon]);
-                    if (dist < 100) { 
-                        cumulativeRisk += Math.pow(Math.max(q.properties.mag, 2), 2) / Math.max(dist, 1);
-                        if (dist < 20 && rand > 0.4) hasDebris = true;
-                    }
-                });
-            }
-
-            if (!hasDebris && rand > 0.95) hasFlood = true;
-            if (!hasFlood && rand > 0.88 && rand <= 0.95) hasDebris = true;
-
-            if (isSea) cumulativeRisk += 10000;
-            if (hasDebris && !isSea) { cumulativeRisk += 80; debrisCount++; } // Increased debris risk for huge ETA penalties
-            if (hasFlood && !isSea) { cumulativeRisk += 100; floodCount++; } 
-
-            row.push({
-                x, y,
-                lat: cellLat, lon: cellLon,
-                risk: Math.min(cumulativeRisk, 10000),
-                anomaly: isSea ? null : (hasFlood ? 'Flood' : (hasDebris ? 'Debris' : null))
-            });
-        }
-        grid.push(row);
+    if (distanceKm < hazard.radiusKm * meta.blockFactor * 0.55 && hazard.severity > 0.76) {
+      blocked = true;
     }
+  });
 
-    const toGrid = (pt) => {
-        let x = Math.floor((pt[1] - minLon) / lonStep);
-        let y = Math.floor((pt[0] - minLat) / latStep);
-        x = Math.max(0, Math.min(x, GRID_W - 1));
-        y = Math.max(0, Math.min(y, GRID_H - 1));
-        return {x, y};
-    };
-
-    const startNode = toGrid(start);
-    const endNode = toGrid(end);
-
-    const getNeighbors = (node) => {
-        const dirs = [[0,1], [1,0], [0,-1], [-1,0], [1,1], [1,-1], [-1,1], [-1,-1]];
-        const res = [];
-        for (let d of dirs) {
-            const nx = node.x + d[0];
-            const ny = node.y + d[1];
-            if (nx >= 0 && nx < GRID_W && ny >= 0 && ny < GRID_H) res.push(grid[ny][nx]);
-        }
-        return res;
-    };
-
-    const runAStar = (mode, primaryPathKeys = new Set()) => {
-        const frontier = new PriorityQueue();
-        frontier.put(grid[startNode.y][startNode.x], 0);
-        const came_from = new Map();
-        const cost_so_far = new Map();
-        const startKey = `${startNode.x},${startNode.y}`;
-        
-        came_from.set(startKey, null);
-        cost_so_far.set(startKey, 0);
-
-        while (!frontier.isEmpty()) {
-            const current = frontier.get();
-            if (current.x === endNode.x && current.y === endNode.y) break;
-            const currKey = `${current.x},${current.y}`;
-            
-            for (let next of getNeighbors(current)) {
-                const nextKey = `${next.x},${next.y}`;
-                let moveCost = haversineDistance([current.lat, current.lon], [next.lat, next.lon]);
-                
-                if (next.risk >= 9000) moveCost += 10000;
-
-                if (mode === 'safest' && next.risk < 9000) moveCost += (next.risk * 4.0);
-                
-                if (mode === 'alternative' && next.risk < 9000) {
-                     moveCost += (next.risk * 4.0);
-                     if (primaryPathKeys.has(nextKey)) moveCost += 150; 
-                }
-
-                const new_cost = cost_so_far.get(currKey) + moveCost;
-                if (!cost_so_far.has(nextKey) || new_cost < cost_so_far.get(nextKey)) {
-                    cost_so_far.set(nextKey, new_cost);
-                    const priority = new_cost + haversineDistance([next.lat, next.lon], [grid[endNode.y][endNode.x].lat, grid[endNode.y][endNode.x].lon]);
-                    frontier.put(next, priority);
-                    came_from.set(nextKey, current);
-                }
-            }
-        }
-
-        let curr = grid[endNode.y][endNode.x];
-        const path = [];
-        let totalRisk = 0; let totalDistance = 0;
-        const usedKeys = new Set();
-        
-        while (curr) {
-            path.push([curr.lat, curr.lon]);
-            usedKeys.add(`${curr.x},${curr.y}`);
-            if (curr.risk < 9000) totalRisk += curr.risk; 
-            const prev = came_from.get(`${curr.x},${curr.y}`);
-            if (prev) totalDistance += haversineDistance([curr.lat, curr.lon], [prev.lat, prev.lon]);
-            curr = prev;
-        }
-
-        path.reverse();
-        if (path.length > 0) { path[0] = start; path[path.length - 1] = end; }
-        
-        // V9: ETA CALCULATION ALGORITHM
-        // Default speed 60 km/h on clear roads.
-        // Drops exponentially based on path risk density (debris, floods).
-        let avgRiskPerKm = totalDistance > 0 ? (totalRisk / totalDistance) : 0;
-        let speedLimit = 60 - (avgRiskPerKm * 1.8);
-        if (speedLimit < 3) speedLimit = 3; // Absolute minimum crawl speed (3 km/h over heavy rubble)
-        
-        let etaMinutes = totalDistance > 0 ? (totalDistance / speedLimit) * 60 : 0;
-
-        return { 
-            path, 
-            score: totalRisk.toFixed(1), 
-            distance: totalDistance.toFixed(1), 
-            eta: Math.ceil(etaMinutes),
-            usedKeys 
-        };
-    };
-
-    const shortest = runAStar('shortest');
-    const safest = runAStar('safest');
-    
-    let safestAlt = null;
-    if (isOperationMode) {
-        safestAlt = runAStar('alternative', safest.usedKeys);
+  scenario.safeCorridors.forEach((corridor) => {
+    const laneDistance = distanceToSegmentKm(cellPoint, corridor.path[0], corridor.path[1]);
+    if (laneDistance < corridor.widthKm) {
+      const relief = corridor.boost * (1 - laneDistance / corridor.widthKm);
+      risk -= relief;
+      drivers.push({
+        type: 'safe-corridor',
+        label: corridor.label,
+        impact: Number((-relief).toFixed(1)),
+        color: '#10b981',
+      });
     }
+  });
 
-    const dangerousCells = [];
-    grid.forEach(row => { row.forEach(cell => {
-         if (cell.anomaly || (cell.risk > 15 && cell.risk < 9000)) dangerousCells.push(cell);
-    });});
+  const weatherPenalty =
+    clamp((scenario.weather.windKmh - 10) * 0.6, 0, 12) +
+    clamp((scenario.weather.humidity - 45) * 0.18, 0, 8);
 
-    res.json({
-        shortest, safest, safestAlt, dangerousCells,
-        cellDimensions: { lat: latStep, lon: lonStep },
-        satelliteReport: { sectorsScanned: GRID_W * GRID_H, debrisFound: debrisCount, floodedAreas: floodCount }
+  risk += weatherPenalty;
+  const normalized = clamp(risk, 0, 100);
+
+  return {
+    risk: normalized,
+    blocked,
+    topDrivers: drivers
+      .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
+      .slice(0, 3),
+  };
+}
+
+function buildGrid(scenario, start, end) {
+  const { minLat, maxLat, minLon, maxLon } = getBoundsForRoute(scenario, start, end);
+  const width = 34;
+  const height = 34;
+  const latStep = (maxLat - minLat) / height;
+  const lonStep = (maxLon - minLon) / width;
+  const grid = [];
+
+  for (let y = 0; y < height; y += 1) {
+    const row = [];
+    for (let x = 0; x < width; x += 1) {
+      const point = [minLat + y * latStep + latStep / 2, minLon + x * lonStep + lonStep / 2];
+      const score = scoreCell(point, scenario);
+
+      row.push({
+        x,
+        y,
+        lat: point[0],
+        lon: point[1],
+        risk: score.risk,
+        blocked: score.blocked,
+        topDrivers: score.topDrivers,
+      });
+    }
+    grid.push(row);
+  }
+
+  return { grid, width, height, latStep, lonStep, minLat, minLon };
+}
+
+function toGridCell(point, layout) {
+  let x = Math.floor((point[1] - layout.minLon) / layout.lonStep);
+  let y = Math.floor((point[0] - layout.minLat) / layout.latStep);
+  x = clamp(x, 0, layout.width - 1);
+  y = clamp(y, 0, layout.height - 1);
+  return { x, y };
+}
+
+function getNeighbors(node, layout) {
+  const directions = [
+    [0, 1],
+    [1, 0],
+    [0, -1],
+    [-1, 0],
+    [1, 1],
+    [1, -1],
+    [-1, 1],
+    [-1, -1],
+  ];
+
+  return directions
+    .map(([dx, dy]) => ({ x: node.x + dx, y: node.y + dy }))
+    .filter((candidate) => candidate.x >= 0 && candidate.x < layout.width && candidate.y >= 0 && candidate.y < layout.height)
+    .map((candidate) => layout.grid[candidate.y][candidate.x]);
+}
+
+function reconstructPath(cameFrom, endNode, start, end) {
+  let current = endNode;
+  let key = `${current.x},${current.y}`;
+  const path = [];
+  let totalRisk = 0;
+  let totalDistance = 0;
+  let blockedNearby = 0;
+  const usedKeys = new Set();
+  const driverMap = new Map();
+
+  while (current) {
+    path.push([current.lat, current.lon]);
+    usedKeys.add(key);
+    totalRisk += current.risk;
+    if (current.blocked) {
+      blockedNearby += 1;
+    }
+    current.topDrivers.forEach((driver) => {
+      if (driver.type === 'safe-corridor') {
+        return;
+      }
+      driverMap.set(driver.type, (driverMap.get(driver.type) || 0) + Math.abs(driver.impact));
     });
+
+    const previous = cameFrom.get(key);
+    if (previous) {
+      totalDistance += haversineDistance([current.lat, current.lon], [previous.lat, previous.lon]);
+      key = `${previous.x},${previous.y}`;
+    }
+    current = previous || null;
+  }
+
+  path.reverse();
+  if (path.length) {
+    path[0] = start;
+    path[path.length - 1] = end;
+  }
+
+  const driverSummary = [...driverMap.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([type, impact]) => `${HAZARD_META[type]?.label || type} etkisi ${impact.toFixed(0)}`);
+
+  const avgRisk = totalDistance > 0 ? totalRisk / Math.max(path.length, 1) : totalRisk;
+  const speedKmh = clamp(48 - avgRisk * 0.35, 10, 52);
+  const etaMinutes = totalDistance > 0 ? Math.ceil((totalDistance / speedKmh) * 60) : 0;
+
+  return {
+    path,
+    riskScore: Number(avgRisk.toFixed(1)),
+    distanceKm: Number(totalDistance.toFixed(1)),
+    etaMinutes,
+    blockedNearby,
+    driverSummary,
+    usedKeys,
+  };
+}
+
+function buildDirectRoute(start, end, scenario) {
+  const points = [];
+  const samples = 24;
+  let totalDistance = 0;
+  let totalRisk = 0;
+  let blockedNearby = 0;
+  const driverMap = new Map();
+  let previous = null;
+
+  for (let step = 0; step <= samples; step += 1) {
+    const ratio = step / samples;
+    const point = [
+      start[0] + (end[0] - start[0]) * ratio,
+      start[1] + (end[1] - start[1]) * ratio,
+    ];
+
+    const score = scoreCell(point, scenario);
+    points.push(point);
+    totalRisk += score.risk;
+
+    if (score.blocked) {
+      blockedNearby += 1;
+    }
+
+    score.topDrivers.forEach((driver) => {
+      if (driver.type === 'safe-corridor') {
+        return;
+      }
+      driverMap.set(driver.type, (driverMap.get(driver.type) || 0) + Math.abs(driver.impact));
+    });
+
+    if (previous) {
+      totalDistance += haversineDistance(previous, point);
+    }
+    previous = point;
+  }
+
+  const avgRisk = totalRisk / Math.max(points.length, 1);
+  const speedKmh = clamp(46 - avgRisk * 0.28, 8, 48);
+  const driverSummary = [...driverMap.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([type, impact]) => `${HAZARD_META[type]?.label || type} etkisi ${impact.toFixed(0)}`);
+
+  return {
+    path: points,
+    riskScore: Number(avgRisk.toFixed(1)),
+    distanceKm: Number(totalDistance.toFixed(1)),
+    etaMinutes: Math.ceil((totalDistance / speedKmh) * 60),
+    blockedNearby,
+    driverSummary,
+    usedKeys: new Set(),
+  };
+}
+
+function serializeRoute(route) {
+  if (!route) {
+    return null;
+  }
+
+  return {
+    path: route.path,
+    riskScore: route.riskScore,
+    distanceKm: route.distanceKm,
+    etaMinutes: route.etaMinutes,
+    blockedNearby: route.blockedNearby,
+    driverSummary: route.driverSummary,
+  };
+}
+
+function runAStar(mode, layout, start, end, primaryPathKeys = new Set()) {
+  const startNode = toGridCell(start, layout);
+  const endNode = toGridCell(end, layout);
+  const frontier = new PriorityQueue();
+  const cameFrom = new Map();
+  const costSoFar = new Map();
+  const startKey = `${startNode.x},${startNode.y}`;
+  const startCell = layout.grid[startNode.y][startNode.x];
+
+  frontier.put(startCell, 0);
+  cameFrom.set(startKey, null);
+  costSoFar.set(startKey, 0);
+
+  while (!frontier.isEmpty()) {
+    const current = frontier.get();
+    const currentKey = `${current.x},${current.y}`;
+
+    if (current.x === endNode.x && current.y === endNode.y) {
+      break;
+    }
+
+    getNeighbors(current, layout).forEach((next) => {
+      const nextKey = `${next.x},${next.y}`;
+      let stepCost = haversineDistance([current.lat, current.lon], [next.lat, next.lon]);
+
+      if (mode === 'shortest') {
+        if (next.blocked) {
+          stepCost += 48;
+        }
+        stepCost += next.risk * 0.06;
+      }
+      if (mode === 'balanced') {
+        if (next.blocked) {
+          stepCost += 190;
+        }
+        stepCost += next.risk * 0.7;
+      }
+      if (mode === 'safest') {
+        if (next.blocked) {
+          stepCost += 420;
+        }
+        stepCost += next.risk * 1.24;
+        if (next.risk > 42) {
+          stepCost += 24;
+        }
+      }
+      if (mode === 'alternative') {
+        if (next.blocked) {
+          stepCost += 360;
+        }
+        stepCost += next.risk * 1.02;
+        if (primaryPathKeys.has(nextKey)) {
+          stepCost += 42;
+        }
+      }
+
+      const newCost = costSoFar.get(currentKey) + stepCost;
+      if (!costSoFar.has(nextKey) || newCost < costSoFar.get(nextKey)) {
+        costSoFar.set(nextKey, newCost);
+        const heuristic = haversineDistance(
+          [next.lat, next.lon],
+          [layout.grid[endNode.y][endNode.x].lat, layout.grid[endNode.y][endNode.x].lon]
+        );
+        frontier.put(next, newCost + heuristic);
+        cameFrom.set(nextKey, current);
+      }
+    });
+  }
+
+  return reconstructPath(cameFrom, layout.grid[endNode.y][endNode.x], start, end);
+}
+
+function buildResponseScenario(scenario) {
+  const summary = summarizeScenario(scenario);
+
+  return {
+    ...summary,
+    sites: scenario.sites,
+    hazards: scenario.hazards.map((hazard) => ({
+      ...hazard,
+      color: HAZARD_META[hazard.type]?.color,
+      typeLabel: HAZARD_META[hazard.type]?.label,
+    })),
+    safeCorridors: scenario.safeCorridors,
+    defaultRoute: scenario.defaultRoute,
+  };
+}
+
+app.get('/api/scenarios', (req, res) => {
+  res.json(SCENARIOS.map((scenario) => buildResponseScenario(scenario)));
+});
+
+app.get('/api/scenarios/:id', (req, res) => {
+  const scenario = getScenarioById(req.params.id);
+  if (!scenario) {
+    return res.status(404).json({ error: 'Scenario not found' });
+  }
+
+  return res.json(buildResponseScenario(scenario));
+});
+
+app.post('/api/route', (req, res) => {
+  const { scenarioId, start, end, includeContingency = true } = req.body;
+  const scenario = getScenarioById(scenarioId);
+
+  if (!scenario) {
+    return res.status(404).json({ error: 'Scenario not found' });
+  }
+
+  let startPoint = start;
+  let endPoint = end;
+
+  if (!startPoint || !endPoint) {
+    const defaultStart = getSiteById(scenario, scenario.defaultRoute.startSiteId);
+    const defaultEnd = getSiteById(scenario, scenario.defaultRoute.endSiteId);
+    startPoint = defaultStart.coords;
+    endPoint = defaultEnd.coords;
+  }
+
+  const layout = buildGrid(scenario, startPoint, endPoint);
+  const shortest = buildDirectRoute(startPoint, endPoint, scenario);
+  const balanced = runAStar('balanced', layout, startPoint, endPoint);
+  const safest = runAStar('safest', layout, startPoint, endPoint);
+  const contingency = includeContingency ? runAStar('alternative', layout, startPoint, endPoint, safest.usedKeys) : null;
+
+  const riskReductionScore = Math.max(0, shortest.riskScore - safest.riskScore);
+  const riskReductionPercent =
+    shortest.riskScore > 0 ? (riskReductionScore / shortest.riskScore) * 100 : 0;
+  const dangerousCells = layout.grid
+    .flat()
+    .filter((cell) => cell.blocked || cell.risk >= 32)
+    .map((cell) => ({
+      lat: cell.lat,
+      lon: cell.lon,
+      risk: Number(cell.risk.toFixed(1)),
+      blocked: cell.blocked,
+      topDriver: cell.topDrivers[0] || null,
+    }));
+
+  return res.json({
+    scenario: buildResponseScenario(scenario),
+    routes: {
+      shortest: serializeRoute(shortest),
+      balanced: serializeRoute(balanced),
+      safest: serializeRoute(safest),
+      contingency: serializeRoute(contingency),
+    },
+    analysis: {
+      recommendedMode: 'safest',
+      riskReduction: Number(riskReductionScore.toFixed(1)),
+      riskReductionPercent: Number(riskReductionPercent.toFixed(1)),
+      avoidedBlockedCells: Math.max(0, shortest.blockedNearby - safest.blockedNearby),
+      etaBufferMinutes: Math.max(0, safest.etaMinutes - shortest.etaMinutes),
+      scanSummary: {
+        sectorsScanned: layout.width * layout.height,
+        aiFindings: scenario.hazards.length,
+        confidence: scenario.mission.confidence,
+      },
+      brief: safest.driverSummary,
+    },
+    dangerousCells,
+    cellDimensions: { lat: layout.latStep, lon: layout.lonStep },
+  });
 });
 
 app.listen(PORT, () => {
